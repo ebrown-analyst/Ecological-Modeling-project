@@ -1,0 +1,269 @@
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+library(unmarked)
+library(tidyverse)
+
+# Step 1: Load the data
+bird <- read.csv("PineRidge_BirdData.csv")
+
+# Step 2: Specify the desired species
+desired_species <- "bhco"  # Target species identifier
+
+# Step 3: Create a new column indicating if the observation is the desired species
+bird <- bird %>%
+  mutate(is_desired_species = ifelse(species == desired_species, 1, 0))
+
+# Step 4: Create a binary presence/absence column based on detection
+bird <- bird %>%
+  mutate(detected = ifelse(is_desired_species == 1 & !is.na(a.v), 1, 0))  # Adjust based on your detection criteria
+
+# Step 5: Create the detection history matrix
+detection_matrix <- bird %>%
+  group_by(point, visit.num) %>%
+  summarise(detected = max(detected, na.rm = TRUE), .groups = 'drop') %>%
+  pivot_wider(names_from = visit.num, values_from = detected, values_fill = 0)
+
+# View the detection matrix
+print(detection_matrix)
+print(dim(detection_matrix))  # Check dimensions
+
+bird <- bird %>%
+  mutate(
+    start = paste0(start, ":00"),  # Add ":00" to create "HH:MM:00"
+    end = paste0(end, ":00")       # Add ":00" to create "HH:MM:00"
+  )
+
+# Step 2: Convert 'start' and 'end' times to hms (hours, minutes, seconds)
+bird <- bird %>%
+  mutate(
+    start_time = hms(start),  # Convert "HH:MM:00" to hms format
+    end_time = hms(end)       # Convert "HH:MM:00" to hms format
+  )
+
+bird <- bird %>%
+  mutate(
+    time_of_day = hour(start_time)  # Extract the hour as 'time_of_day'
+  )
+
+# Step 6: Create site covariates
+site_covariates <- bird %>%
+  group_by(point) %>%
+  summarise(
+    cover = first(cover),         # Cover type (e.g., forest, grassland)
+    burn = first(burn),           # Burn type (e.g., burned, unburned)
+    wind = mean(wind, na.rm = TRUE), # Average wind speed for each site
+    date = first(date),           # Date of the visit
+    time_of_day = mean(time_of_day, na.rm = TRUE), # Average time of day for each site (mean of start times)
+    .groups = 'drop'
+  )
+
+# Check site covariates
+print(site_covariates)
+print(dim(site_covariates))  # Check dimensions
+
+# Step 7: Create an unmarkedFrame for the occupancy model
+detection_data <- as.matrix(detection_matrix[, -1])  # Exclude the point column
+
+# Ensure detection_data is not empty
+if (nrow(detection_data) == 0) {
+  stop("The detection data is empty. Check your detection matrix.")
+}
+
+data_unmarked <- unmarkedFrameOccu(y = detection_data, siteCovs = site_covariates)
+summary(data_unmarked)
+
+# Step 8: Fit models
+# 1. Basic Occupancy Model (Cover Type)
+basic_model <- occu(~ wind + time_of_day ~ cover, data = data_unmarked)
+summary(basic_model)
+
+# 2. Full Model (Cover Type, Burn Type, Environmental Covariates)
+full_model <- occu(~ wind + time_of_day ~ cover + burn, data = data_unmarked)
+summary(full_model)
+
+# 3. Interaction Model (Cover Type x Burn Type)
+interaction_model <- occu(~ wind + time_of_day ~ cover * burn, data = data_unmarked)
+summary(interaction_model)
+
+# 4. Temporal Model (Including Date/Time)
+temporal_model <- occu(~ wind + time_of_day + date ~ cover + burn, data = data_unmarked)
+summary(temporal_model)
+
+# 5. Null Model
+null_model <- occu(~ wind + time_of_day + date ~ 1, data = data_unmarked)
+summary(null_model)
+
+# Step 9: Model Comparison using AIC
+model_list <- list(
+  basic_model = basic_model,
+  full_model = full_model,
+  interaction_model = interaction_model,
+  temporal_model = temporal_model,
+  null_model = null_model
+)
+aic_table <- data.frame(Model = character(), AIC = numeric(), k = integer())
+for (model_name in names(model_list)) {
+  model <- model_list[[model_name]]
+  if (!is.null(model)) {
+    log_lik <- logLik(model)
+    k <- length(coef(model))  # Number of parameters
+    aic <- -2 * log_lik + 2 * k
+    aic_table <- rbind(aic_table, data.frame(Model = model_name, AIC = aic, k = k))
+  }
+}
+aic_table <- aic_table %>% arrange(AIC)
+print(aic_table)
+
+
+# Step 10: Goodness-of-Fit (GOF) Test - Using Parametric Bootstrap for the Basic Model
+# Define the deviance statistic function
+dev_statistic <- function(model) {
+  return(-2 * logLik(model))  # Deviance is -2*log-likelihood
+}
+
+# Perform the parametric bootstrap using the 'parboot' function
+set.seed(123)  # For reproducibility
+gof_test <- parboot(basic_model, nsim = 1000, statistic = dev_statistic)
+
+# Print a summary of the GOF test results
+summary(gof_test)
+# Plot the results of the GOF test to visualize the bootstrap deviances
+plot(gof_test)
+
+
+# Step 11: Residuals Analysis for Basic Model
+# Get residuals
+residuals_basic <- residuals(basic_model)
+
+# Plot residuals
+plot(residuals_basic, main = "Residuals of Basic Model", ylab = "Residuals", xlab = "Index")
+abline(h = 0, col = "red")
+
+
+# Generate predictions for occupancy (state) probabilities using site_covariates
+occupancy_pred <- predict(basic_model, type = "state", newdata = site_covariates)
+
+# Check the first few predictions to ensure they're generated
+head(occupancy_pred)
+
+
+# Create a data frame for plotting with the predicted occupancy probabilities
+occupancy_pred_df <- data.frame(
+  cover = site_covariates$cover,  # Covariate for x-axis (Cover Type)
+  occupancy_prob = occupancy_pred  # Predicted occupancy probabilities
+)
+
+head(occupancy_pred_df)
+
+
+# Generate predictions with standard error for occupancy (state) and detection
+occupancy_pred_se <- predict(basic_model, type = "state", newdata = site_covariates, se.fit = TRUE)
+summary(occupancy_pred_se)
+# Check the structure of the returned object
+str(occupancy_pred_se)
+# Check if predictions are generated
+head(occupancy_pred_se$Predicted)  # This should give you predicted occupancy probabilities
+head(occupancy_pred_se$SE)  # This should give you standard errors
+
+# Create a data frame for plotting occupancy predictions
+occupancy_pred_df <- data.frame(
+  cover = site_covariates$cover,  # Cover types
+  occupancy_prob = occupancy_pred_se$Predicted,  # Predicted occupancy probabilities
+  se = occupancy_pred_se$SE  # Standard error of predictions
+)
+
+# Check the structure of the data frame
+head(occupancy_pred_df)
+
+ggplot(occupancy_pred_df, aes(x = cover, y = occupancy_prob)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "skyblue") +
+  geom_errorbar(
+    aes(ymin = occupancy_prob - se, ymax = occupancy_prob + se),  # Add error bars
+    width = 0.2, 
+    color = "red"
+  ) +
+  labs(
+    title = "Predicted Occupancy Probability by Cover Type",
+    x = "Cover Type",
+    y = "Occupancy Probability"
+  ) +
+  theme_minimal()
+head(occupancy_pred_df)
+summary(occupancy_pred_df$cover)
+
+
+
+
+# Generate predictions with standard error for detection (type = "det")
+detection_pred_se <- predict(basic_model, type = "det", newdata = site_covariates, se.fit = TRUE)
+
+# Check the structure of the returned object
+str(detection_pred_se)
+
+# Check if predictions are generated
+head(detection_pred_se$Predicted)  # This should give you predicted detection probabilities
+head(detection_pred_se$SE)  # This should give you standard errors
+
+# Create a data frame for plotting detection predictions
+detection_pred_df <- data.frame(
+  cover = site_covariates$cover,  # Cover types
+  detection_prob = detection_pred_se$Predicted,  # Predicted detection probabilities
+  se = detection_pred_se$SE  # Standard error of predictions
+)
+
+
+# Check the structure of the data frame
+head(detection_pred_df)
+
+# Display summary of the detection prediction data
+summary(detection_pred_df)
+
+
+
+
+
+
+
+
+new_data <- data.frame(
+  wind = site_covariates$wind,        # Wind data (replace with your covariate data)
+  time_of_day = site_covariates$time_of_day  # Time of day (replace with your covariate data)
+)
+
+# Predict detection probabilities
+detection_probabilities <- predict(basic_model, type = "det", newdata = new_data)
+
+# Print the prediction results
+print(detection_probabilities)
+# Predict detection probabilities using the fitted model
+detection_pred <- predict(basic_model, type = "det", newdata = new_data)
+
+
+# Calculate the p-value by comparing t0 to t.star
+p_value <- mean(gof_test@t.star >= gof_test@t0)
+p_value
+
+# Create a table with the observed test statistic and p-value
+gof_summary <- data.frame(
+  "Observed Test Statistic" = gof_test@t0,
+  "P-Value" = p_value
+)
+
+# Print the summary table
+print(gof_summary)
+library(AICcmodavg)
+# Perform the goodness-of-fit test on the fitted occupancy model
+gof_test <- mb.gof.test(basic_model)
+summary(gof_test)
+gof_test$chi.square
+gof_test$p.value
+# Extract chi-square statistic and p-value
+gof_result <- data.frame(
+  Model = "Basic Occupancy Model",  # You can update this with your model name
+  Chi_Square = gof_test$chi.square,
+  P_Value = gof_test$p.value
+)
+
+# Print the table
+print(gof_result)
